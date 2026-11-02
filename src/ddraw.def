@@ -1,0 +1,7 @@
+LIBRARY ddraw
+EXPORTS
+    DirectDrawCreate        = hf_DirectDrawCreate        @8
+    DirectDrawCreateClipper = hf_DirectDrawCreateClipper @9
+    DirectDrawCreateEx      = hf_DirectDrawCreateEx      @10
+    DirectDrawEnumerateA    = hf_DirectDrawEnumerateA    @11
+    DirectDrawEnumerateExA  = hf_DirectDrawEnumerateExA  @12
