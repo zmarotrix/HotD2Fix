@@ -324,6 +324,11 @@ void Surface7::UploadIfDirty()
             uint32_t hsh = 2166136261u;
             for (uint32_t c : buf) { hsh ^= c; hsh *= 16777619u; }
             r->hash = hsh;
+            // Soft effects have plenty of partially transparent texels; cut-out
+            // sprites and models only have a stray few (or none).
+            size_t partial = 0;
+            for (uint32_t c : buf) { uint32_t a = c >> 24; if (a >= 16 && a < 240) partial++; }
+            r->softAlpha = partial > 8 && partial * 50 > buf.size();
         }
         if (g_cfg.dumpTextures && s == r) DumpTexture(r, buf.data());
         R::UploadTexture(r->tex, s->level, buf.data(), s->desc.dwWidth, s->desc.dwHeight);

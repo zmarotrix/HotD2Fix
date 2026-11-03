@@ -276,6 +276,7 @@ void Device7::ApplyRS(DWORD s, DWORD v)
     case D3DRENDERSTATE_SPECULARMATERIALSOURCE: case D3DRENDERSTATE_AMBIENTMATERIALSOURCE:
     case D3DRENDERSTATE_EMISSIVEMATERIALSOURCE: case D3DRENDERSTATE_VERTEXBLEND:
     case D3DRENDERSTATE_CLIPPLANEENABLE:
+        if (s == D3DRENDERSTATE_ZENABLE && v > 1) LogOnce("game asks for W-buffering");
         R::SetRS(s, v);
         break;
     case D3DRENDERSTATE_ALPHATESTENABLE: case D3DRENDERSTATE_ALPHAREF: case D3DRENDERSTATE_ALPHAFUNC:
@@ -285,6 +286,9 @@ void Device7::ApplyRS(DWORD s, DWORD v)
     default:
         if (s >= D3DRENDERSTATE_WRAP0 && s <= D3DRENDERSTATE_WRAP7) { R::SetRS(s, v); break; }
         if (s == D3DRENDERSTATE_ZBIAS) {
+            char b[40];
+            wsprintfA(b, "game uses ZBIAS %u", v);
+            LogOnce(b);
             // D3D7 integer bias (0..16) -> D3D9 float depth bias
             R::SetRS(D9_RS_DEPTHBIAS, F2DW(-(float)v * 0.000004f));
             R::SetRS(D9_RS_SLOPESCALEDEPTHBIAS, F2DW(v ? -(float)v * 0.25f : 0.0f));
@@ -504,22 +508,27 @@ const void* Device7::PrepareDraw(DWORD fvf, const void* v, DWORD n)
 
 // Transparent effects (fire, smoke, sparks) are drawn with depth writes on, so
 // their nearly invisible edge texels still occlude anything drawn behind them
-// later: the "halo" around effects.  With FixAlphaHalos:
+// later: the "halo" around effects.  With FixAlphaHalos, and only for draws
+// that really are soft effects (models and translucent characters are drawn
+// blended too, and need their own depth writes to hide their back parts):
 //  * additive effects don't write depth at all (their result is order independent);
-//  * alpha-blended effects are drawn in colour without depth writes, then again
-//    depth-only for texels that are at least HaloAlphaRef opaque, so solid parts
-//    still occlude correctly.
+//  * effects with a softly transparent texture are drawn in colour without
+//    depth writes, then again depth-only for texels that are at least
+//    HaloAlphaRef opaque, so solid parts still occlude correctly.
 void Device7::Submit(DWORD prim, DWORD fvf, const void* v, DWORD n, const WORD* idx, DWORD ni)
 {
     bool blended = rs[D3DRENDERSTATE_ALPHABLENDENABLE] && rs[D3DRENDERSTATE_DESTBLEND] != D3DBLEND_ZERO;
-    if (!g_cfg.fixHalos || !blended || !rs[D3DRENDERSTATE_ZENABLE] || !rs[D3DRENDERSTATE_ZWRITEENABLE]) {
+    bool additive = rs[D3DRENDERSTATE_DESTBLEND] == D3DBLEND_ONE;
+    Surface7* t = tex[0] && !tex[0]->rt ? tex[0]->root : NULL;
+    bool effect = additive || (t && t->softAlpha);
+    if (!g_cfg.fixHalos || !blended || !effect || !rs[D3DRENDERSTATE_ZENABLE] || !rs[D3DRENDERSTATE_ZWRITEENABLE]) {
         R::Draw(prim, fvf, v, n, idx, ni);
         return;
     }
     R::SetRS(D3DRENDERSTATE_ZWRITEENABLE, FALSE);
     R::Draw(prim, fvf, v, n, idx, ni);
 
-    if (rs[D3DRENDERSTATE_DESTBLEND] != D3DBLEND_ONE && g_cfg.haloAlphaRef <= 255) {
+    if (!additive && g_cfg.haloAlphaRef <= 255) {
         DWORD ref = rs[D3DRENDERSTATE_ALPHATESTENABLE] ? (rs[D3DRENDERSTATE_ALPHAREF] & 0xFF) : 0;
         if (ref < (DWORD)g_cfg.haloAlphaRef) ref = g_cfg.haloAlphaRef;
         R::SetRS(D9_RS_COLORWRITEENABLE, 0);
@@ -624,7 +633,8 @@ void Device7::ProbeDraw(DWORD prim, DWORD fvf, const void* v, DWORD n, const WOR
     DWORD tw = t ? t->desc.dwWidth : 0, th = t ? t->desc.dwHeight : 0;
     Log("probe #%ld fvf=%X prim=%u verts=%u%s tex=%ux%u_%08X%s uv=(%.5f,%.5f) texel=(%.2f,%.2f) "
         "uvrange u[%.4f..%.4f] v[%.4f..%.4f] addr=%u/%u%s filt=%u/%u%s pad=%d",
-        drawNo, fvf, prim, n, idx ? " indexed" : "", tw, th, t ? t->hash : 0, (t && t->hasCK) ? " ck" : "",
+        drawNo, fvf, prim, n, idx ? " indexed" : "", tw, th, t ? t->hash : 0,
+        (t && t->hasCK) ? (t->softAlpha ? " ck soft" : " ck") : (t && t->softAlpha) ? " soft" : "",
         hu, hv, hu * tw, hv * th, umin, umax, vmin, vmax, addrU[0], addrV[0], clampForced ? " (clamped)" : "",
         tss[0][D3DTSS_MAGFILTER], tss[0][D3DTSS_MINFILTER], filtersForced ? " (smoothed)" : "", (int)paddedBound);
     Log("        blend=%u src=%u dst=%u atest=%u afunc=%u aref=%u ck=%u zen=%u zwrite=%u zfunc=%u cull=%u fog=%u "
@@ -743,6 +753,13 @@ HRESULT Device7::SetTransform(D3DTRANSFORMSTATETYPE t, LPD3DMATRIX m)
     if (Rec()) { recording->xf.push_back(t); recording->xfV[t] = *m; return D3D_OK; }
     xf[t] = *m;
     R::SetTransform(XFTo9(t), (const float*)m);
+    if (t == D3DTRANSFORMSTATE_PROJECTION && m->_34 != 0 && m->_33 != 0 && m->_33 != 1) {
+        // depth range, for diagnosing precision problems
+        char b[96];
+        int n = (int)(-m->_43 / m->_33 * 1000), f = (int)(-m->_43 / (m->_33 - 1));
+        wsprintfA(b, "projection near=%d.%03d far=%d", n / 1000, n % 1000, f);
+        LogOnce(b);
+    }
     return D3D_OK;
 }
 

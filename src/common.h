@@ -37,6 +37,10 @@ struct Config {
     int   audioLimiter;   // 1 = smooth peak limiter instead of hard clipping
     char  audioDevice[128]; // part of the output device name (empty = Windows default)
     int   probeKey;       // debug: logs every draw under the cursor for one frame
+    int   fastForwardKey; // held: the game runs fastForwardSpeed times faster (cutscenes, credits)
+    int   fastForwardSpeed;
+    int   skipIntro;      // 1 = skip the SEGA / Empire logo cards at startup
+    int   floatDepth;     // 1 = 32-bit float reversed-Z depth (no z-fighting), supersampling instead of MSAA
     int   dumpTextures;   // debug: save every texture the game loads as PNG
     int   dumpEvery;      // debug: save every Nth presented frame as BMP (0 = off)
 };
@@ -46,6 +50,7 @@ void LoadConfig();
 void Log(const char* fmt, ...);
 void LogV(const char* fmt, ...);   // only when logLevel >= 2
 void LogOnce(const char* what);    // logs a given message once per process
+void Time_SetScale(int scale);     // speed of the clock the game sees (fast forward)
 
 const char* GameDir();
 extern LONG g_liveSurfaces;   // debug counter (ddraw.cpp)

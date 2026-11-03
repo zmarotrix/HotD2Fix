@@ -44,6 +44,7 @@ static void KeyEvent(int dik, bool down)
     if (dik < 0 || dik > 255) return;
     bool was = s_prevDown[dik] != 0;
     s_prevDown[dik] = down;
+    if (dik == VkToDik(g_cfg.fastForwardKey) && down != was) R::FastForwardKey(down);
     if (!down || was) return;
     if (dik == VkToDik(g_cfg.screenshotKey)) R::Hotkey(R::HOTKEY_SCREENSHOT);
     if (dik == VkToDik(g_cfg.haloToggleKey)) R::Hotkey(R::HOTKEY_HALO);
@@ -56,8 +57,8 @@ static HRESULT STDMETHODCALLTYPE H_GetDeviceState(IDirectInputDevice7A* self, DW
     HRESULT hr = s_realGetState(self, size, data);
     if (SUCCEEDED(hr) && data && size >= 256 && IsKeyboard(self)) {
         const BYTE* keys = (const BYTE*)data;
-        int watch[4] = { VkToDik(g_cfg.screenshotKey), VkToDik(g_cfg.haloToggleKey), VkToDik(g_cfg.smoothToggleKey),
-                         VkToDik(g_cfg.probeKey) };
+        int watch[5] = { VkToDik(g_cfg.screenshotKey), VkToDik(g_cfg.haloToggleKey), VkToDik(g_cfg.smoothToggleKey),
+                         VkToDik(g_cfg.probeKey), VkToDik(g_cfg.fastForwardKey) };
         for (int k : watch)
             if (k >= 0) KeyEvent(k, (keys[k] & 0x80) != 0);
     }

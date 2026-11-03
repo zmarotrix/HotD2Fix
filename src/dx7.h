@@ -84,8 +84,9 @@ struct Surface7 : IDirectDrawSurface7 {
     R::Target*  rt = NULL;
     R::Depth*   ds = NULL;
     R::Texture* tex = NULL;            // only on the root of a texture chain
-    R::Texture* texPadded = NULL;
-    uint32_t   hash = 0;                // FNV-1a of level 0 (ARGB), for diagnostics      // copy with transparent texels colour-padded (root only)
+    R::Texture* texPadded = NULL;      // copy with transparent texels colour-padded (root only)
+    uint32_t   hash = 0;               // FNV-1a of level 0 (ARGB), for diagnostics
+    bool       softAlpha = false;      // level 0 has gradual transparency (smoke, fire), not just cut-outs
 
     Surface7*  root = this;            // owner of an implicit chain
     std::vector<Surface7*> chain;      // root: implicitly created surfaces

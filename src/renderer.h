@@ -40,6 +40,7 @@ void     Present(Target* t, const RECT* srcGame);
 void     WaitVBlank();                          // paces like a 60 Hz vblank
 enum { HOTKEY_SCREENSHOT = 1, HOTKEY_HALO = 2, HOTKEY_SMOOTH = 3, HOTKEY_PROBE = 4 };
 void     Hotkey(int which);                     // queued, handled at the next Present
+void     FastForwardKey(bool down);             // held state of the fast-forward key
 // Writes an ARGB image as PNG (synchronously); alpha keeps the alpha channel.
 bool     SavePNG(const char* path, const uint32_t* argb, int w, int h, bool alpha);
 // Where the game image lands inside the window client area (client pixels).

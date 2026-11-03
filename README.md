@@ -20,21 +20,28 @@ It works with both PC releases:
   the game's 640x480 mode is emulated and shown borderless fullscreen or in a window.
   **Alt+Enter** switches at any time.
 - **High resolution.** The game renders internally at a multiple of 640x480 (automatically
-  1920x1440 on a 1440p screen, 2560x1920 on 4K) with 4x MSAA, kept at 4:3 with black bars.
+  1920x1440 on a 1440p screen, 2560x1920 on 4K), anti-aliased by rendering at twice that and
+  scaling down, kept at 4:3 with black bars.
   The HUD and text stay sharp.
+- **No depth flicker.** A 32-bit floating-point depth buffer keeps surfaces that lie almost on
+  top of each other (like the floor in the Magician fight) from flickering.
 - **Steady 60 fps**, independent of your monitor's refresh rate.
 - **Aiming lines up at any window size**, for mouse and lightguns that act as a mouse.
 - **Visual fixes:**
-  - Smooth (bilinear and anisotropic) textures on 3D scenes, where the PC port used blocky
-    point sampling. The HUD keeps its original crisp look. Toggle live with **F9**.
+  - Optional smooth (bilinear and anisotropic) textures on 3D scenes, where the PC port used
+    point sampling. Off by default; the HUD always keeps its original crisp look. Toggle live
+    with **F9**.
   - Fire, smoke and sparks no longer cut see-through "halos" into what's behind them.
-    Toggle live with **F11**.
+    Characters and other models are left exactly as the game draws them. Toggle live with
+    **F11**.
   - No dark fringes or stray lines along sprite edges, for example above the towers behind
     the first boss.
 - **Modern audio.** A new low-latency mixer outputs straight to WASAPI (10 ms), follows your
   default output device when it changes, supports the game's 3D positional sound, and adds a
   limiter so overlapping sounds don't distort.
 - **Screenshots.** **F12** saves a full-resolution PNG to a `screenshots` folder.
+- **Fast forward.** Hold **F7** to run the game 8x faster, for example through cutscenes or the
+  ending credits to see which ending you got.
 - Everything is configurable in `hod2fix.ini`, and every fix can be turned off.
 
 ## Installing
@@ -84,8 +91,9 @@ ones:
 |---|---|---|
 | `[Display] Fullscreen` | `1` | Borderless fullscreen (`1`) or window (`0`) |
 | `[Display] RenderScale` | `0` | Internal resolution multiplier; `0` picks the largest that fits your screen |
-| `[Display] MSAA` | `4` | Anti-aliasing: 0, 2, 4 or 8 |
-| `[Display] SmoothTextures` | `1` | Smooth 3D textures (`0` = original blocky look) |
+| `[Display] DepthBuffer` | `float` | `float` = no depth flicker, anti-aliased by 2x supersampling; `24` = classic depth with MSAA |
+| `[Display] MSAA` | `4` | Anti-aliasing: 0 = off; 2, 4 or 8 = MSAA (only with `DepthBuffer=24`) |
+| `[Display] SmoothTextures` | `0` | Smooth 3D textures (`1`), or the original sharp look (`0`) |
 | `[Display] FixAlphaHalos` | `1` | Remove see-through halos around effects |
 | `[Display] KeepAspect` | `1` | Keep 4:3 (`0` stretches) |
 | `[Display] FPSLimit` | `60` | Keep at 60: the game logic runs at 60 Hz |
@@ -93,6 +101,8 @@ ones:
 | `[Audio] LatencyMs` | `10` | Raise it if you ever hear crackling |
 | `[Audio] Device` | *(empty)* | Part of a device name to force a specific output |
 | `[System] PauseInBackground` | `1` | The game pauses when unfocused, as originally |
+| `[System] SkipIntroLogos` | `1` | Skip the SEGA and Empire logo cards at startup |
+| `[System] FastForwardKey` | `F7` | Hold to fast forward; `FastForwardSpeed` sets how fast (2-32) |
 
 ## Hotkeys
 
@@ -100,6 +110,7 @@ ones:
 |---|---|
 | Alt+Enter | Switch between fullscreen and window |
 | F12 | Full-resolution PNG screenshot to `screenshots\` |
+| F7 (hold) | Fast forward (8x) through cutscenes and credits |
 | F11 | Toggle the halo fix (compare with the original) |
 | F9 | Toggle texture smoothing (compare with the original) |
 | F8 | Debug probe: log every draw under the cursor to `hod2fix.log` |
@@ -129,8 +140,8 @@ each call:
   D3D7 render, texture-stage and transform states map onto D3D9. Pre-transformed (2D) vertices
   are rescaled with pixel centres preserved. Colour keys are emulated with alpha. Presentation
   goes through an additional swap chain, so resizing never resets the device.
-- **Effects fixes:** blended effects draw colour without depth writes, then depth only for
-  their solid parts. Sprites that use exactly one copy of their texture are clamped at the
+- **Effects fixes:** blended effects (draws whose texture has soft, gradual transparency, or
+  that are additive) draw colour without depth writes, then depth only for their solid parts. Sprites that use exactly one copy of their texture are clamped at the
   edges, wherever that copy sits. Smoothed draws with transparency sample a copy whose
   transparent texels carry their neighbours' colour.
 - **Audio** (`src/audio.cpp`): `DirectSoundCreate` is redirected to a software mixer: float

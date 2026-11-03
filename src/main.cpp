@@ -82,6 +82,8 @@ static int ParseKey(const char* k)
     if (!lstrcmpiA(k, "Insert")) return VK_INSERT;
     if (!lstrcmpiA(k, "Home")) return VK_HOME;
     if (!lstrcmpiA(k, "End")) return VK_END;
+    if (!lstrcmpiA(k, "Tab")) return VK_TAB;
+    if (!lstrcmpiA(k, "Backspace")) return VK_BACK;
     if (!k[1] && ((k[0] >= 'A' && k[0] <= 'Z') || (k[0] >= '0' && k[0] <= '9'))) return k[0];
     if (!k[1] && k[0] >= 'a' && k[0] <= 'z') return k[0] - 32;
     return (int)strtol(k, NULL, 0);
@@ -93,7 +95,7 @@ void LoadConfig()
     g_cfg.windowScale = IniInt("Display", "WindowScale", 0);
     g_cfg.renderScale = IniInt("Display", "RenderScale", 0);
     g_cfg.msaa        = IniInt("Display", "MSAA", 4);
-    g_cfg.forceLinear = IniInt("Display", "SmoothTextures", 1);
+    g_cfg.forceLinear = IniInt("Display", "SmoothTextures", 0);
     g_cfg.anisotropy  = IniInt("Display", "Anisotropy", 16);
     g_cfg.fixHalos    = IniInt("Display", "FixAlphaHalos", 1);
     g_cfg.haloAlphaRef = IniInt("Display", "HaloAlphaRef", 255);
@@ -131,6 +133,14 @@ void LoadConfig()
     GetPrivateProfileStringA("Audio", "Device", "", g_cfg.audioDevice, sizeof(g_cfg.audioDevice), path);
     GetPrivateProfileStringA("Debug", "ProbeKey", "F8", key, sizeof(key), path);
     g_cfg.probeKey = ParseKey(key);
+    GetPrivateProfileStringA("System", "FastForwardKey", "F7", key, sizeof(key), path);
+    g_cfg.fastForwardKey = ParseKey(key);
+    g_cfg.fastForwardSpeed = IniInt("System", "FastForwardSpeed", 8);
+    g_cfg.skipIntro = IniInt("System", "SkipIntroLogos", 1);
+    GetPrivateProfileStringA("Display", "DepthBuffer", "float", key, sizeof(key), path);
+    g_cfg.floatDepth = lstrcmpiA(key, "24") != 0;
+    if (g_cfg.fastForwardSpeed < 2) g_cfg.fastForwardSpeed = 2;
+    if (g_cfg.fastForwardSpeed > 32) g_cfg.fastForwardSpeed = 32;
 }
 
 // ---------------------------------------------------------------------------
@@ -335,6 +345,48 @@ static BOOL WINAPI H_SetWindowPos(HWND h, HWND after, int x, int y, int w, int h
     return SetWindowPos(h, after, x, y, w, hh, flags);
 }
 
+// The game times its frames with QueryPerformanceCounter / GetTickCount.  It
+// sees a clock that runs Time_SetScale times faster during fast forward, and
+// stays continuous (never jumps back) when the speed changes.
+static CRITICAL_SECTION s_clockLock;
+static LONGLONG s_realBase, s_gameBase;
+static int      s_timeScale = 1;
+
+static LONGLONG GameClock()
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    EnterCriticalSection(&s_clockLock);
+    LONGLONG t = s_gameBase + (now.QuadPart - s_realBase) * s_timeScale;
+    LeaveCriticalSection(&s_clockLock);
+    return t;
+}
+
+void Time_SetScale(int scale)
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    EnterCriticalSection(&s_clockLock);
+    s_gameBase += (now.QuadPart - s_realBase) * s_timeScale;
+    s_realBase = now.QuadPart;
+    s_timeScale = scale < 1 ? 1 : scale;
+    LeaveCriticalSection(&s_clockLock);
+}
+
+static BOOL WINAPI H_QueryPerformanceCounter(LARGE_INTEGER* c)
+{
+    if (!c) return FALSE;
+    c->QuadPart = GameClock();
+    return TRUE;
+}
+
+static DWORD WINAPI H_GetTickCount()
+{
+    static LONGLONG freq;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
+    return (DWORD)(GameClock() / (freq / 1000));
+}
+
 static void PatchIAT(HMODULE mod, const char* dll, const char* func, void* hook)
 {
     BYTE* base = (BYTE*)mod;
@@ -360,12 +412,55 @@ static void PatchIAT(HMODULE mod, const char* dll, const char* func, void* hook)
     }
 }
 
+// The European release opens with SEGA and Empire logo cards, run by a small
+// state machine: a dispatcher (switch over states 0-5) whose last state hands
+// over to the title.  The dispatcher is found by its code, right after that
+// last state's function:
+//   end:   mov [mode], 3 / mov [state], 0 / jmp cleanup / nop padding
+//   disp:  mov eax, [state] / cmp eax, 5 / ja ... / jmp [eax*4 + table]
+// and made to jump straight to the end.
+static void SkipIntroLogos(HMODULE exe)
+{
+    BYTE* base = (BYTE*)exe;
+    IMAGE_NT_HEADERS* nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
+        if (!(sec->Characteristics & IMAGE_SCN_CNT_CODE)) continue;
+        BYTE* p = base + sec->VirtualAddress;
+        BYTE* lim = p + sec->Misc.VirtualSize - 64;
+        for (; p < lim; p++) {
+            if (p[0] != 0xC7 || p[1] != 0x05 || *(DWORD*)(p + 6) != 3 || p[10] != 0xC7 || p[11] != 0x05 ||
+                *(DWORD*)(p + 16) != 0 || p[20] != 0xE9) continue;
+            DWORD state = *(DWORD*)(p + 12);
+            BYTE* d = p + 25;
+            while (*d == 0x90 && d < p + 48) d++;
+            if (d[0] != 0xA1 || *(DWORD*)(d + 1) != state || d[5] != 0x83 || d[6] != 0xF8 || d[7] != 0x05 ||
+                d[8] != 0x77 || d[10] != 0xFF || d[11] != 0x24 || d[12] != 0x85) continue;
+            DWORD old;
+            VirtualProtect(d, 5, PAGE_EXECUTE_READWRITE, &old);
+            d[0] = 0xE9;
+            *(LONG*)(d + 1) = (LONG)(p - (d + 5));
+            VirtualProtect(d, 5, old, &old);
+            FlushInstructionCache(GetCurrentProcess(), d, 5);
+            Log("skipping the intro logo cards");
+            return;
+        }
+    }
+    LogV("no intro logo cards found (Japanese release has none)");
+}
+
 void Input_InstallHooks(void (*patchIAT)(HMODULE, const char*, const char*, void*));
 void Audio_InstallHooks();
 
 static void InstallHooks()
 {
     HMODULE exe = GetModuleHandleA(NULL);
+    InitializeCriticalSection(&s_clockLock);
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    s_realBase = s_gameBase = now.QuadPart;
+    PatchIAT(exe, "KERNEL32.dll", "QueryPerformanceCounter", (void*)H_QueryPerformanceCounter);
+    PatchIAT(exe, "KERNEL32.dll", "GetTickCount", (void*)H_GetTickCount);
     PatchIAT(exe, "USER32.dll", "GetClientRect", (void*)H_GetClientRect);
     PatchIAT(exe, "USER32.dll", "GetCursorPos", (void*)H_GetCursorPos);
     PatchIAT(exe, "USER32.dll", "SetCursorPos", (void*)H_SetCursorPos);
@@ -373,6 +468,7 @@ static void InstallHooks()
     PatchIAT(exe, "USER32.dll", "SetWindowPos", (void*)H_SetWindowPos);
     Input_InstallHooks(PatchIAT);
     Audio_InstallHooks();
+    if (g_cfg.skipIntro) SkipIntroLogos(exe);
 }
 
 // ---------------------------------------------------------------------------

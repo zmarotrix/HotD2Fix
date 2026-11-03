@@ -69,6 +69,31 @@ static bool                 s_haveMapping;
 static int                  s_clientW, s_clientH;
 static DWORD                s_maxAniso = 16;
 
+// Depth precision.  With [Display] DepthBuffer=float the depth buffer is 32-bit
+// float with "reversed Z" (near = 1, far = 0), which spreads precision evenly
+// with distance; the game's near plane is tiny (0.8) and its floors are built
+// from layers 0.003 apart, which 24-bit depth can't separate past ~100 units.
+// The game never sees the difference: its projection, depth tests, clears,
+// viewports and pre-transformed vertices are mirrored here on the way to D3D9.
+// D3D9 can't multisample float depth, so anti-aliasing is done by rendering
+// at twice the resolution instead.
+static bool                 s_revZ;
+static D3DFORMAT            s_depthFmt = D3DFMT_D24S8;
+
+static float RevZ(float z) { return s_revZ ? 1.0f - z : z; }
+static DWORD RevZFunc(DWORD f)
+{
+    if (!s_revZ) return f;
+    switch (f) {
+    case D3DCMP_LESS:         return D3DCMP_GREATER;
+    case D3DCMP_LESSEQUAL:    return D3DCMP_GREATEREQUAL;
+    case D3DCMP_GREATER:      return D3DCMP_LESS;
+    case D3DCMP_GREATEREQUAL: return D3DCMP_LESSEQUAL;
+    }
+    return f;
+}
+static DWORD StripStencil(DWORD flags) { return s_depthFmt == D3DFMT_D24S8 ? flags : flags & ~D3DCLEAR_STENCIL; }
+
 // ---------------------------------------------------------------------------
 // Frame pacing
 // ---------------------------------------------------------------------------
@@ -97,10 +122,23 @@ static void PreciseSleepUntil(LONGLONG target)
     }
 }
 
+// Fast forward: the game advances one logic tick per presented frame, so while
+// the key is held frames are paced fastForwardSpeed times faster and only one
+// in fastForwardSpeed reaches the screen.
+static volatile LONG s_ffHeld;   // from the game's DirectInput keyboard
+static bool          s_fast;
+
+void FastForwardKey(bool down)
+{
+    if (down) LogOnce("fast forward key seen in the game's DirectInput data");
+    InterlockedExchange(&s_ffHeld, down ? 1 : 0);
+}
+
 static void Pace()
 {
     if (g_cfg.fpsLimit <= 0) return;
     LONGLONG period = s_qpf.QuadPart / g_cfg.fpsLimit;
+    if (s_fast) period /= g_cfg.fastForwardSpeed;
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     if (s_next.QuadPart == 0 || now.QuadPart > s_next.QuadPart + period * 3) {
@@ -222,8 +260,16 @@ bool Init(HWND hwnd)
     int monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
     s_scale = g_cfg.renderScale > 0 ? g_cfg.renderScale : monH / (g_gameH > 0 ? g_gameH : 480);
     if (s_scale < 1) s_scale = 1;
+    s_revZ = g_cfg.floatDepth &&
+             SUCCEEDED(s_d3d->CheckDeviceFormat(adapter, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, D3DUSAGE_DEPTHSTENCIL,
+                                                D3DRTYPE_SURFACE, D3DFMT_D32F_LOCKABLE));
+    if (s_revZ) {
+        s_depthFmt = D3DFMT_D32F_LOCKABLE;
+        if (g_cfg.msaa >= 2 && g_cfg.renderScale <= 0) s_scale *= 2;   // supersampling instead of MSAA
+    }
     if (s_scale > 8) s_scale = 8;
     Log("render scale %dx (%dx%d internal)", s_scale, g_gameW * s_scale, g_gameH * s_scale);
+    Log("depth buffer: %s", s_revZ ? "32-bit float, reversed" : "24-bit");
 
     WNDCLASSA wc = {};
     wc.lpfnWndProc = DummyProc;
@@ -256,7 +302,7 @@ bool Init(HWND hwnd)
     s_dev->GetDeviceCaps(&caps);
     s_maxAniso = caps.MaxAnisotropy ? caps.MaxAnisotropy : 1;
 
-    if (g_cfg.msaa >= 2) {
+    if (g_cfg.msaa >= 2 && !s_revZ) {
         for (int m = g_cfg.msaa; m >= 2; m--) {
             DWORD q1 = 0, q2 = 0;
             if (SUCCEEDED(s_d3d->CheckDeviceMultiSampleType(adapter, D3DDEVTYPE_HAL, D3DFMT_X8R8G8B8, TRUE, (D3DMULTISAMPLE_TYPE)m, &q1)) &&
@@ -360,7 +406,7 @@ Depth* CreateDepth(int w, int h)
     Depth* d = new Depth();
     d->gw = w; d->gh = h;
     d->sw = w * s_scale; d->sh = h * s_scale;
-    HRESULT hr = s_dev->CreateDepthStencilSurface(d->sw, d->sh, D3DFMT_D24S8, s_msType, s_msQuality, FALSE, &d->surf, NULL);
+    HRESULT hr = s_dev->CreateDepthStencilSurface(d->sw, d->sh, s_depthFmt, s_msType, s_msQuality, FALSE, &d->surf, NULL);
     if (FAILED(hr)) { Log("CreateDepth failed 0x%08X", hr); delete d; return NULL; }
     return d;
 }
@@ -532,7 +578,7 @@ void ClearDepth(Depth* d, float z)
     D3DVIEWPORT9 full = { 0, 0, (DWORD)d->sw, (DWORD)d->sh, 0.0f, 1.0f };
     if (s_curRT) { full.Width = s_curRT->sw < d->sw ? s_curRT->sw : d->sw; full.Height = s_curRT->sh < d->sh ? s_curRT->sh : d->sh; }
     s_dev->SetViewport(&full);
-    s_dev->Clear(0, NULL, D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL, 0, z, 0);
+    s_dev->Clear(0, NULL, StripStencil(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL), 0, RevZ(z), 0);
     s_dev->SetDepthStencilSurface(oldDS);
     s_dev->SetViewport(&vp);
     SafeRelease(oldDS);
@@ -854,11 +900,43 @@ void Present(Target* t, const RECT* srcGame)
     if (!s_dev || !t) return;
     DumpFrame(t);
     static int presents = 0;
-    if (g_cfg.logLevel >= 2 && (++presents % 1800) == 0) {
+    if (++presents % 1800 == 0 && g_cfg.logLevel >= 2) {
         PROCESS_MEMORY_COUNTERS_EX pm = { sizeof(pm) };
         GetProcessMemoryInfo(GetCurrentProcess(), (PROCESS_MEMORY_COUNTERS*)&pm, sizeof(pm));
         Log("frame %d: live surfaces %ld, private %u MB", presents, g_liveSurfaces, (unsigned)(pm.PrivateUsage >> 20));
     }
+    bool ffDown = g_cfg.fastForwardKey && (s_ffHeld || (GetAsyncKeyState(g_cfg.fastForwardKey) & 0x8000));
+    if (ffDown && GetForegroundWindow() != s_hwnd) {
+        char cls[64] = "", b[160];
+        GetClassNameA(GetForegroundWindow(), cls, sizeof(cls));
+        wsprintfA(b, "fast forward key held, but the game window isn't in front (%s)", cls);
+        LogOnce(b);
+    }
+    bool fast = ffDown && GetForegroundWindow() == s_hwnd;
+    if (fast != s_fast) {
+        static int ffStartFrame;
+        static ULONGLONG ffStartMs;
+        s_fast = fast;
+        Time_SetScale(fast ? g_cfg.fastForwardSpeed : 1);
+        if (fast) {
+            ffStartFrame = presents;
+            ffStartMs = GetTickCount64();
+            Log("fast forward on");
+            ShowToast("Fast forward >>");
+        } else {
+            ULONGLONG ms = GetTickCount64() - ffStartMs;
+            Log("fast forward off: %d game frames in %u ms", presents - ffStartFrame, (unsigned)ms);
+        }
+    }
+    static int ffFrame;
+    if (fast && ++ffFrame % g_cfg.fastForwardSpeed) {
+        // a skipped frame: the game's work is done, nothing is shown
+        if (s_haveMapping) PollHotkeys(t);
+        if (!s_waited) Pace();
+        s_waited = false;
+        return;
+    }
+
     if (s_inScene) { s_dev->EndScene(); }
 
     RECT rc;
@@ -943,7 +1021,9 @@ void Clear(DWORD count, const RECT* rects, DWORD flags, DWORD color, float z, DW
 {
     if (!s_dev || !s_curRT) return;
     if (!s_curDS) flags &= ~(D3DCLEAR_ZBUFFER | D3DCLEAR_STENCIL);
+    flags = StripStencil(flags);
     if (!flags) return;
+    z = RevZ(z);
     if (count && rects) {
         std::vector<D3DRECT> sr(count);
         for (DWORD i = 0; i < count; i++) {
@@ -957,7 +1037,19 @@ void Clear(DWORD count, const RECT* rects, DWORD flags, DWORD color, float z, DW
     if (s_curRT->msaa) s_curRT->dirty = true;
 }
 
-void SetRS(DWORD state, DWORD value) { if (s_dev) s_dev->SetRenderState((D3DRENDERSTATETYPE)state, value); }
+void SetRS(DWORD state, DWORD value)
+{
+    if (!s_dev) return;
+    if (state == D3DRS_ZFUNC) value = RevZFunc(value);
+    if (s_revZ && (state == D3DRS_DEPTHBIAS || state == D3DRS_SLOPESCALEDEPTHBIAS)) {
+        float f;
+        memcpy(&f, &value, 4);
+        f = -f;
+        memcpy(&value, &f, 4);
+    }
+    if (state == D3DRS_STENCILENABLE && value && s_depthFmt != D3DFMT_D24S8) LogOnce("game uses stencil, which float depth lacks");
+    s_dev->SetRenderState((D3DRENDERSTATETYPE)state, value);
+}
 void SetTSS(DWORD stage, DWORD type, DWORD value) { if (s_dev) s_dev->SetTextureStageState(stage, (D3DTEXTURESTAGESTATETYPE)type, value); }
 
 void SetSampler(DWORD stage, DWORD type, DWORD value)
@@ -981,7 +1073,16 @@ void SetTextureTarget(DWORD stage, Target* t)
     s_dev->SetTexture(stage, t ? t->tex : NULL);
 }
 
-void SetTransform(DWORD type, const float* m16) { if (s_dev) s_dev->SetTransform((D3DTRANSFORMSTATETYPE)type, (const D3DMATRIX*)m16); }
+void SetTransform(DWORD type, const float* m16)
+{
+    if (!s_dev) return;
+    D3DMATRIX m = *(const D3DMATRIX*)m16;
+    if (s_revZ && type == D3DTS_PROJECTION) {
+        // z' = w - z, so depth/w becomes 1 - depth/w
+        m._13 = m._14 - m._13; m._23 = m._24 - m._23; m._33 = m._34 - m._33; m._43 = m._44 - m._43;
+    }
+    s_dev->SetTransform((D3DTRANSFORMSTATETYPE)type, &m);
+}
 
 void SetViewport(DWORD x, DWORD y, DWORD w, DWORD h, float minZ, float maxZ)
 {
@@ -995,8 +1096,8 @@ void SetViewport(DWORD x, DWORD y, DWORD w, DWORD h, float minZ, float maxZ)
     if (vp.Y > (DWORD)s_curRT->sh) vp.Y = s_curRT->sh;
     if (vp.X + vp.Width > (DWORD)s_curRT->sw) vp.Width = s_curRT->sw - vp.X;
     if (vp.Y + vp.Height > (DWORD)s_curRT->sh) vp.Height = s_curRT->sh - vp.Y;
-    vp.MinZ = minZ;
-    vp.MaxZ = maxZ;
+    vp.MinZ = s_revZ ? 1.0f - maxZ : minZ;
+    vp.MaxZ = s_revZ ? 1.0f - minZ : maxZ;
     s_dev->SetViewport(&vp);
 }
 
@@ -1060,8 +1161,9 @@ void Draw(DWORD prim, DWORD fvf, const void* verts, DWORD vcount, const WORD* id
     }
 
     const void* vp = verts;
-    if ((fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW && (s_curRT->sw != s_curRT->gw || s_curRT->sh != s_curRT->gh)) {
-        // Scale pre-transformed positions, keeping pixel centres aligned.
+    if ((fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW && (s_revZ || s_curRT->sw != s_curRT->gw || s_curRT->sh != s_curRT->gh)) {
+        // Scale pre-transformed positions, keeping pixel centres aligned (and
+        // mirror their depth for reversed Z).
         size_t bytes = (size_t)stride * vcount;
         if (s_vtmp.size() < bytes) s_vtmp.resize(bytes);
         memcpy(s_vtmp.data(), verts, bytes);
@@ -1072,6 +1174,7 @@ void Draw(DWORD prim, DWORD fvf, const void* verts, DWORD vcount, const WORD* id
             float* f = (float*)p;
             f[0] = (f[0] + 0.5f) * sx - 0.5f;
             f[1] = (f[1] + 0.5f) * sy - 0.5f;
+            f[2] = RevZ(f[2]);
         }
         vp = s_vtmp.data();
     }
