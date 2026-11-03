@@ -255,3 +255,5 @@ struct Device7;
 DDraw7* CreateDDraw7();
 void    DeviceDescFill(D3DDEVICEDESC7* d, const GUID& guid, bool hw, bool tnl);
 void    PresentSurface(Surface7* src, const RECT* srcRect);
+void    D3D7_FlushTransparent();   // draws queued transparent geometry now (d3d7.cpp)
+void    DumpTextureNow(Surface7* s);   // debug: save a texture to textures_dump (ddraw.cpp)

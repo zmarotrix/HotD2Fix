@@ -304,6 +304,17 @@ static void DumpTexture(Surface7* s, const uint32_t* argb)
     R::SavePNG(path, argb, w, h, true);
 }
 
+// Debug (F8): saves the texture a probed draw uses, as uploaded.
+void DumpTextureNow(Surface7* s)
+{
+    Surface7* r = s->root;
+    std::vector<uint32_t> buf((size_t)r->desc.dwWidth * r->desc.dwHeight);
+    RECT full;
+    r->FullRect(&full);
+    r->ToARGB(full, buf.data(), r->hasCK);
+    DumpTexture(r, buf.data());
+}
+
 void Surface7::UploadIfDirty()
 {
     Surface7* r = root;
@@ -480,6 +491,7 @@ static void FillCPU(Surface7* s, const RECT& r, DWORD color)
 
 HRESULT Surface7::Blt(LPRECT dr, LPDIRECTDRAWSURFACE7 srcI, LPRECT sr, DWORD flags, LPDDBLTFX fx)
 {
+    if (rt || (srcI && ((Surface7*)srcI)->rt)) D3D7_FlushTransparent();   // 2D work on a 3D target goes on top
     if (flags & DDBLT_COLORFILL) {
         if (!fx) return DDERR_INVALIDPARAMS;
         RECT r; if (dr) r = *dr; else FullRect(&r);
@@ -508,6 +520,7 @@ HRESULT Surface7::BltBatch(LPDDBLTBATCH, DWORD, DWORD) { return DDERR_UNSUPPORTE
 
 HRESULT Surface7::BltFast(DWORD x, DWORD y, LPDIRECTDRAWSURFACE7 srcI, LPRECT sr, DWORD flags)
 {
+    if (rt || (srcI && ((Surface7*)srcI)->rt)) D3D7_FlushTransparent();
     Surface7* src = (Surface7*)srcI;
     if (!src) return DDERR_INVALIDPARAMS;
     RECT s; if (sr) s = *sr; else src->FullRect(&s);
@@ -590,6 +603,7 @@ HRESULT Surface7::GetColorKey(DWORD flags, LPDDCOLORKEY k)
 
 HRESULT Surface7::GetDC(HDC* out)
 {
+    if (rt) D3D7_FlushTransparent();
     if (!out) return DDERR_INVALIDPARAMS;
     if (dc) return DDERR_DCALREADYCREATED;
     int w = desc.dwWidth, h = desc.dwHeight;
@@ -665,6 +679,7 @@ HRESULT Surface7::Lock(LPRECT r, LPDDSURFACEDESC2 d, DWORD flags, HANDLE)
 {
     if (!d) return DDERR_INVALIDPARAMS;
     if (kind == SK_DEPTH) { LogOnce("Lock on a Z buffer is not supported"); return DDERR_GENERIC; }
+    if (rt) D3D7_FlushTransparent();
     if (mem.empty()) AllocMem();
     RECT full; FullRect(&full);
     lockHasRect = r != NULL;
@@ -780,6 +795,7 @@ HRESULT Surface7::GetLOD(LPDWORD l) { if (!l) return DDERR_INVALIDPARAMS; *l = l
 void PresentSurface(Surface7* src, const RECT* srcRect)
 {
     if (!src) return;
+    D3D7_FlushTransparent();
     if (src->rt) {
         R::Present(src->rt, srcRect);
         return;

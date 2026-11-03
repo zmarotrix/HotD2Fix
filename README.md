@@ -31,9 +31,11 @@ It works with both PC releases:
   - Optional smooth (bilinear and anisotropic) textures on 3D scenes, where the PC port used
     point sampling. Off by default; the HUD always keeps its original crisp look. Toggle live
     with **F9**.
-  - Fire, smoke and sparks no longer cut see-through "halos" into what's behind them.
-    Characters and other models are left exactly as the game draws them. Toggle live with
-    **F11**.
+  - Transparency done properly: smoke, fire, sparks and text are drawn after the rest of the
+    scene, back to front, so they blend with what's really behind them. No see-through
+    "halos" around effects or text, and nothing pokes through smoke. Toggle live with **F11**.
+  - Correct lighting on scaled models (for example the fish in the water boss fight no
+    longer render solid white).
   - No dark fringes or stray lines along sprite edges, for example above the towers behind
     the first boss.
 - **Modern audio.** A new low-latency mixer outputs straight to WASAPI (10 ms), follows your
@@ -94,7 +96,7 @@ ones:
 | `[Display] DepthBuffer` | `float` | `float` = no depth flicker, anti-aliased by 2x supersampling; `24` = classic depth with MSAA |
 | `[Display] MSAA` | `4` | Anti-aliasing: 0 = off; 2, 4 or 8 = MSAA (only with `DepthBuffer=24`) |
 | `[Display] SmoothTextures` | `0` | Smooth 3D textures (`1`), or the original sharp look (`0`) |
-| `[Display] FixAlphaHalos` | `1` | Remove see-through halos around effects |
+| `[Display] FixAlphaHalos` | `1` | Sorted transparency: no see-through halos around effects and text |
 | `[Display] KeepAspect` | `1` | Keep 4:3 (`0` stretches) |
 | `[Display] FPSLimit` | `60` | Keep at 60: the game logic runs at 60 Hz |
 | `[Audio] Enabled` | `1` | New mixer (`0` = Windows' DirectSound) |
@@ -111,7 +113,7 @@ ones:
 | Alt+Enter | Switch between fullscreen and window |
 | F12 | Full-resolution PNG screenshot to `screenshots\` |
 | F7 (hold) | Fast forward (8x) through cutscenes and credits |
-| F11 | Toggle the halo fix (compare with the original) |
+| F11 | Toggle sorted transparency (compare with the original) |
 | F9 | Toggle texture smoothing (compare with the original) |
 | F8 | Debug probe: log every draw under the cursor to `hod2fix.log` |
 | Esc | Quit (the game's own behaviour) |
@@ -140,8 +142,12 @@ each call:
   D3D7 render, texture-stage and transform states map onto D3D9. Pre-transformed (2D) vertices
   are rescaled with pixel centres preserved. Colour keys are emulated with alpha. Presentation
   goes through an additional swap chain, so resizing never resets the device.
-- **Effects fixes:** blended effects (draws whose texture has soft, gradual transparency, or
-  that are additive) draw colour without depth writes, then depth only for their solid parts. Sprites that use exactly one copy of their texture are clamped at the
+- **Sorted transparency:** opaque draws go straight to the GPU; blended draws that test depth
+  are queued with a copy of their vertices and the device state, and replayed back to front
+  by distance once the opaque scene is done (end of scene, clear, render-target change,
+  present, 2D work, or a draw that ignores depth such as a fade). Soft and additive effects
+  replay without depth writes. Normals are always renormalized, as hardware of the time did.
+- **Edge fixes:** sprites that use exactly one copy of their texture are clamped at the
   edges, wherever that copy sits. Smoothed draws with transparency sample a copy whose
   transparent texels carry their neighbours' colour.
 - **Audio** (`src/audio.cpp`): `DirectSoundCreate` is redirected to a software mixer: float

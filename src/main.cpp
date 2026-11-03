@@ -98,9 +98,6 @@ void LoadConfig()
     g_cfg.forceLinear = IniInt("Display", "SmoothTextures", 0);
     g_cfg.anisotropy  = IniInt("Display", "Anisotropy", 16);
     g_cfg.fixHalos    = IniInt("Display", "FixAlphaHalos", 1);
-    g_cfg.haloAlphaRef = IniInt("Display", "HaloAlphaRef", 255);
-    if (g_cfg.haloAlphaRef < 1) g_cfg.haloAlphaRef = 1;
-    if (g_cfg.haloAlphaRef > 256) g_cfg.haloAlphaRef = 256;
     g_cfg.edgeInset   = IniInt("Display", "SpriteEdgeFix", 1);
     g_cfg.vsync       = IniInt("Display", "VSync", 0);
     g_cfg.fpsLimit    = IniInt("Display", "FPSLimit", 60);

@@ -15,7 +15,6 @@ struct Config {
     int   msaa;           // 0/2/4/8
     int   forceLinear;    // 1 = bilinear filtering on 3D geometry (2D/HUD untouched)
     int   fixHalos;       // 1 = transparent effects don't cut holes in what's behind them
-    int   haloAlphaRef;   // opacity (1-255) at which effects still write depth; 256 = never
     int   edgeInset;      // 1 = keep smoothed sprites from sampling neighbouring texels
     int   haloToggleKey;  // hotkey that flips fixHalos for comparison (0 = none)
     int   smoothToggleKey; // hotkey that flips forceLinear for comparison (0 = none)

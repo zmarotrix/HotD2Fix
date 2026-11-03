@@ -1,6 +1,7 @@
 // hod2fix - IDirect3D7 / IDirect3DDevice7 / IDirect3DVertexBuffer7.
 #include "dx7.h"
 #include <map>
+#include <algorithm>
 #include <math.h>
 
 // D3D9 numeric values the translation needs (d3d9.h cannot be included here).
@@ -43,6 +44,27 @@ struct StateBlock {
     Surface7* texV[kMaxStages];
 };
 
+// Everything a draw depends on, so it can be replayed later.
+struct DrawSnap {
+    DWORD rs[kNumRS];
+    DWORD tss[kMaxStages][kNumTSS];
+    D3DMATRIX xf[kNumXF];
+    D3DVIEWPORT7 vp;
+    D3DMATERIAL7 mat;
+    Surface7* tex[kMaxStages];   // AddRef'd while held
+    std::map<DWORD, D3DLIGHT7> lights;
+    std::map<DWORD, BOOL> lightOn;
+};
+
+// A transparent draw waiting for the end of the opaque scene.
+struct Deferred {
+    DrawSnap s;
+    DWORD prim, fvf, n, ni;
+    std::vector<BYTE> v;
+    std::vector<WORD> idx;
+    float depth;                 // average distance from the camera
+};
+
 struct Device7 : IDirect3DDevice7 {
     LONG      ref = 1;
     D3D7*     d3d;
@@ -68,6 +90,8 @@ struct Device7 : IDirect3DDevice7 {
     DWORD addrU[kMaxStages], addrV[kMaxStages];   // address modes the game asked for
     bool clampForced = false;
     bool paddedBound = false;                      // stage 0 uses the colour-padded copy
+    std::vector<Deferred*> queue, pool;            // sorted transparency (see FlushTransparent)
+    bool replaying = false;
 
     Device7(D3D7* d, REFCLSID g, Surface7* rtSurf);
     ~Device7();
@@ -83,6 +107,12 @@ struct Device7 : IDirect3DDevice7 {
     const void* PrepareEdges(DWORD fvf, const void* v, DWORD n);
     void Submit(DWORD prim, DWORD fvf, const void* v, DWORD n, const WORD* idx, DWORD ni);
     void ProbeDraw(DWORD prim, DWORD fvf, const void* v, DWORD n, const WORD* idx, DWORD ni);
+    void DrawNow(DWORD prim, DWORD fvf, const void* v, DWORD n, const WORD* idx, DWORD ni);
+    void Draw(DWORD prim, DWORD fvf, const void* v, DWORD n, const WORD* idx, DWORD ni);
+    float ViewDepth(DWORD fvf, const void* v, DWORD n);
+    void TakeSnap(DrawSnap& s);
+    void PutSnap(const DrawSnap& s);
+    void FlushTransparent();
     void Capture(StateBlock* b);
     void Apply(StateBlock* b);
     bool Rec() const { return recording != NULL; }
@@ -138,6 +168,10 @@ struct Device7 : IDirect3DDevice7 {
     STDMETHOD(GetInfo)(DWORD, LPVOID, DWORD);
 };
 
+struct Device7;
+static Device7* s_activeDevice;
+static void ReleaseSnap(DrawSnap& s);
+
 static inline DWORD F2DW(float f) { DWORD d; memcpy(&d, &f, 4); return d; }
 static inline float DW2F(DWORD d) { float f; memcpy(&f, &d, 4); return f; }
 
@@ -176,12 +210,16 @@ Device7::Device7(D3D7* d, REFCLSID g, Surface7* rtSurf) : d3d(d), guid(g), targe
     memset(&clipStatus, 0, sizeof(clipStatus));
     Defaults();
     BindTarget();
+    s_activeDevice = this;
 }
 
 Device7::~Device7()
 {
     for (int i = 0; i < kMaxStages; i++) if (tex[i]) tex[i]->Release();
     for (StateBlock* b : blocks) delete b;
+    for (Deferred* d : queue) { ReleaseSnap(d->s); delete d; }
+    for (Deferred* d : pool) delete d;
+    if (s_activeDevice == this) s_activeDevice = NULL;
     if (target) target->Release();
 }
 
@@ -277,6 +315,10 @@ void Device7::ApplyRS(DWORD s, DWORD v)
     case D3DRENDERSTATE_EMISSIVEMATERIALSOURCE: case D3DRENDERSTATE_VERTEXBLEND:
     case D3DRENDERSTATE_CLIPPLANEENABLE:
         if (s == D3DRENDERSTATE_ZENABLE && v > 1) LogOnce("game asks for W-buffering");
+        // The game shrinks some models (the fish, ~0.15x) without normalizing
+        // normals.  D3D9 then lights them with normals ~7x too long, and the
+        // (N.H)^32 specular term turns them solid white; always renormalize.
+        if (s == D3DRENDERSTATE_NORMALIZENORMALS) v = TRUE;
         R::SetRS(s, v);
         break;
     case D3DRENDERSTATE_ALPHATESTENABLE: case D3DRENDERSTATE_ALPHAREF: case D3DRENDERSTATE_ALPHAFUNC:
@@ -506,41 +548,143 @@ const void* Device7::PrepareDraw(DWORD fvf, const void* v, DWORD n)
     return v;
 }
 
-// Transparent effects (fire, smoke, sparks) are drawn with depth writes on, so
-// their nearly invisible edge texels still occlude anything drawn behind them
-// later: the "halo" around effects.  With FixAlphaHalos, and only for draws
-// that really are soft effects (models and translucent characters are drawn
-// blended too, and need their own depth writes to hide their back parts):
-//  * additive effects don't write depth at all (their result is order independent);
-//  * effects with a softly transparent texture are drawn in colour without
-//    depth writes, then again depth-only for texels that are at least
-//    HaloAlphaRef opaque, so solid parts still occlude correctly.
+// Sorted transparency (FixAlphaHalos).  The game draws transparent things in
+// whatever order suits it, with depth writes on, so the nearly invisible edges
+// of smoke, fire and text hide anything drawn behind them afterwards (the
+// "halos"), and nothing drawn behind them later can show through.  Instead,
+// like a modern renderer:
+//  * opaque draws go straight through;
+//  * transparent draws that test depth are queued with their vertices and the
+//    full device state;
+//  * when the scene is complete (EndScene, Clear, render target change,
+//    present, or a draw that ignores depth such as a fade), the queue is
+//    replayed back to front, so every transparent pixel blends over what is
+//    really behind it;
+//  * soft effects (gradual transparency) and additive glows replay without
+//    depth writes; translucent models keep theirs to hide their own far side.
 void Device7::Submit(DWORD prim, DWORD fvf, const void* v, DWORD n, const WORD* idx, DWORD ni)
 {
-    bool blended = rs[D3DRENDERSTATE_ALPHABLENDENABLE] && rs[D3DRENDERSTATE_DESTBLEND] != D3DBLEND_ZERO;
     bool additive = rs[D3DRENDERSTATE_DESTBLEND] == D3DBLEND_ONE;
     Surface7* t = tex[0] && !tex[0]->rt ? tex[0]->root : NULL;
-    bool effect = additive || (t && t->softAlpha);
-    if (!g_cfg.fixHalos || !blended || !effect || !rs[D3DRENDERSTATE_ZENABLE] || !rs[D3DRENDERSTATE_ZWRITEENABLE]) {
-        R::Draw(prim, fvf, v, n, idx, ni);
+    bool noDepthWrite = replaying && rs[D3DRENDERSTATE_ZWRITEENABLE] && (additive || (t && t->softAlpha));
+    if (noDepthWrite) R::SetRS(D3DRENDERSTATE_ZWRITEENABLE, FALSE);
+    R::Draw(prim, fvf, v, n, idx, ni);
+    if (noDepthWrite) R::SetRS(D3DRENDERSTATE_ZWRITEENABLE, TRUE);
+}
+
+void Device7::DrawNow(DWORD prim, DWORD fvf, const void* v, DWORD n, const WORD* idx, DWORD ni)
+{
+    for (int i = 0; i < kMaxStages; i++) if (tex[i] && !tex[i]->rt && tex[i]->root->dirty) ApplyTexture(i, tex[i]);
+    const void* dv = PrepareDraw(fvf, v, n);
+    if (g_probe == 2) ProbeDraw(prim, fvf, dv, n, idx, ni);
+    Submit(prim, fvf, dv, n, idx, ni);
+}
+
+// Average distance of a draw from the camera (clip-space w), from up to 64 vertices.
+float Device7::ViewDepth(DWORD fvf, const void* v, DWORD n)
+{
+    UINT stride = R::FVFStride(fvf);
+    DWORD step = n > 64 ? n / 64 : 1;
+    bool rhw = (fvf & D3DFVF_POSITION_MASK) == D3DFVF_XYZRHW;
+    D3DMATRIX wv, wvp;
+    if (!rhw) {
+        MatMul(xf[D3DTRANSFORMSTATE_WORLD], xf[D3DTRANSFORMSTATE_VIEW], wv);
+        MatMul(wv, xf[D3DTRANSFORMSTATE_PROJECTION], wvp);
+    }
+    double sum = 0;
+    int cnt = 0;
+    for (DWORD i = 0; i < n; i += step, cnt++) {
+        const float* p = (const float*)((const BYTE*)v + (size_t)i * stride);
+        if (rhw) sum += p[3] > 1e-6f ? 1.0 / p[3] : 1e6;
+        else sum += p[0] * wvp._14 + p[1] * wvp._24 + p[2] * wvp._34 + wvp._44;
+    }
+    return cnt ? (float)(sum / cnt) : 0.0f;
+}
+
+void Device7::TakeSnap(DrawSnap& s)
+{
+    memcpy(s.rs, rs, sizeof(rs));
+    memcpy(s.tss, tss, sizeof(tss));
+    memcpy(s.xf, xf, sizeof(xf));
+    s.vp = vp;
+    s.mat = mat;
+    for (int i = 0; i < kMaxStages; i++) { s.tex[i] = tex[i]; if (tex[i]) tex[i]->AddRef(); }
+    s.lights = lights;
+    s.lightOn = lightOn;
+}
+
+// Makes the device state equal to a snapshot, touching only what differs.
+void Device7::PutSnap(const DrawSnap& s)
+{
+    for (DWORD i = 1; i < kNumRS; i++) if (rs[i] != s.rs[i]) SetRenderState((D3DRENDERSTATETYPE)i, s.rs[i]);
+    for (DWORD st = 0; st < kMaxStages; st++)
+        for (DWORD t = 1; t < kNumTSS; t++)
+            if (tss[st][t] != s.tss[st][t]) SetTextureStageState(st, (D3DTEXTURESTAGESTATETYPE)t, s.tss[st][t]);
+    for (DWORD t = 1; t < kNumXF; t++)
+        if (memcmp(&xf[t], &s.xf[t], sizeof(D3DMATRIX))) SetTransform((D3DTRANSFORMSTATETYPE)t, (LPD3DMATRIX)&s.xf[t]);
+    if (memcmp(&vp, &s.vp, sizeof(vp))) SetViewport((LPD3DVIEWPORT7)&s.vp);
+    if (memcmp(&mat, &s.mat, sizeof(mat))) SetMaterial((LPD3DMATERIAL7)&s.mat);
+    for (DWORD i = 0; i < kMaxStages; i++) if (tex[i] != s.tex[i]) SetTexture(i, s.tex[i]);
+    for (auto& l : s.lights) {
+        auto it = lights.find(l.first);
+        if (it == lights.end() || memcmp(&it->second, &l.second, sizeof(D3DLIGHT7))) SetLight(l.first, (LPD3DLIGHT7)&l.second);
+    }
+    for (auto& l : s.lightOn) {
+        auto it = lightOn.find(l.first);
+        if (it == lightOn.end() || it->second != l.second) LightEnable(l.first, l.second);
+    }
+    for (auto& l : lightOn) if (l.second && !s.lightOn.count(l.first)) LightEnable(l.first, FALSE);
+}
+
+static void ReleaseSnap(DrawSnap& s)
+{
+    for (int i = 0; i < kMaxStages; i++) if (s.tex[i]) { s.tex[i]->Release(); s.tex[i] = NULL; }
+}
+
+void Device7::Draw(DWORD prim, DWORD fvf, const void* v, DWORD n, const WORD* idx, DWORD ni)
+{
+    bool blended = rs[D3DRENDERSTATE_ALPHABLENDENABLE] &&
+                   !(rs[D3DRENDERSTATE_SRCBLEND] == D3DBLEND_ONE && rs[D3DRENDERSTATE_DESTBLEND] == D3DBLEND_ZERO);
+    bool depthTested = rs[D3DRENDERSTATE_ZENABLE] && rs[D3DRENDERSTATE_ZFUNC] != D3DCMP_ALWAYS;
+    if (g_cfg.fixHalos && !replaying && blended && depthTested && v && n) {
+        Deferred* d;
+        if (pool.empty()) d = new Deferred();
+        else { d = pool.back(); pool.pop_back(); }
+        TakeSnap(d->s);
+        d->prim = prim; d->fvf = fvf; d->n = n; d->ni = idx ? ni : 0;
+        d->v.assign((const BYTE*)v, (const BYTE*)v + (size_t)R::FVFStride(fvf) * n);
+        if (idx) d->idx.assign(idx, idx + ni); else d->idx.clear();
+        d->depth = ViewDepth(fvf, v, n);
+        queue.push_back(d);
         return;
     }
-    R::SetRS(D3DRENDERSTATE_ZWRITEENABLE, FALSE);
-    R::Draw(prim, fvf, v, n, idx, ni);
+    // painter's-order draws (fades, overlays) must land on top of the finished scene
+    if (!depthTested) FlushTransparent();
+    DrawNow(prim, fvf, v, n, idx, ni);
+}
 
-    if (!additive && g_cfg.haloAlphaRef <= 255) {
-        DWORD ref = rs[D3DRENDERSTATE_ALPHATESTENABLE] ? (rs[D3DRENDERSTATE_ALPHAREF] & 0xFF) : 0;
-        if (ref < (DWORD)g_cfg.haloAlphaRef) ref = g_cfg.haloAlphaRef;
-        R::SetRS(D9_RS_COLORWRITEENABLE, 0);
-        R::SetRS(D3DRENDERSTATE_ZWRITEENABLE, TRUE);
-        R::SetRS(D3DRENDERSTATE_ALPHATESTENABLE, TRUE);
-        R::SetRS(D3DRENDERSTATE_ALPHAFUNC, D3DCMP_GREATEREQUAL);
-        R::SetRS(D3DRENDERSTATE_ALPHAREF, ref);
-        R::Draw(prim, fvf, v, n, idx, ni);
-        R::SetRS(D9_RS_COLORWRITEENABLE, 0xF);
-        ApplyAlphaTest();
+void Device7::FlushTransparent()
+{
+    if (queue.empty() || replaying) return;
+    replaying = true;
+    DrawSnap cur;
+    TakeSnap(cur);
+    std::stable_sort(queue.begin(), queue.end(), [](const Deferred* a, const Deferred* b) { return a->depth > b->depth; });
+    for (Deferred* d : queue) {
+        PutSnap(d->s);
+        DrawNow(d->prim, d->fvf, d->v.data(), d->n, d->ni ? d->idx.data() : NULL, d->ni);
+        ReleaseSnap(d->s);
+        pool.push_back(d);
     }
-    R::SetRS(D3DRENDERSTATE_ZWRITEENABLE, TRUE);
+    queue.clear();
+    PutSnap(cur);
+    ReleaseSnap(cur);
+    replaying = false;
+}
+
+void D3D7_FlushTransparent()
+{
+    if (s_activeDevice) s_activeDevice->FlushTransparent();
 }
 
 // Debug (F8): logs every draw in the current frame that covers the probe
@@ -646,6 +790,25 @@ void Device7::ProbeDraw(DWORD prim, DWORD fvf, const void* v, DWORD n, const WOR
         tss[0][D3DTSS_COLOROP], tss[0][D3DTSS_COLORARG1], tss[0][D3DTSS_COLORARG2],
         tss[0][D3DTSS_ALPHAOP], tss[0][D3DTSS_ALPHAARG1], tss[0][D3DTSS_ALPHAARG2],
         rs[D3DRENDERSTATE_TEXTUREFACTOR], hitTri[0], hitTri[1], hitTri[2]);
+    int lightsOn = 0;
+    for (auto& l : lightOn) if (l.second) lightsOn++;
+    Log("        light=%u lights=%d ambient=%08X spec=%u colorvertex=%u diffsrc=%u ambsrc=%u specsrc=%u emisrc=%u "
+        "mat d=(%.2f,%.2f,%.2f,%.2f) a=(%.2f,%.2f,%.2f) s=(%.2f,%.2f,%.2f) e=(%.2f,%.2f,%.2f) power=%.2f",
+        rs[D3DRENDERSTATE_LIGHTING], lightsOn, rs[D3DRENDERSTATE_AMBIENT], rs[D3DRENDERSTATE_SPECULARENABLE],
+        rs[D3DRENDERSTATE_COLORVERTEX], rs[D3DRENDERSTATE_DIFFUSEMATERIALSOURCE], rs[D3DRENDERSTATE_AMBIENTMATERIALSOURCE],
+        rs[D3DRENDERSTATE_SPECULARMATERIALSOURCE], rs[D3DRENDERSTATE_EMISSIVEMATERIALSOURCE],
+        mat.dcvDiffuse.r, mat.dcvDiffuse.g, mat.dcvDiffuse.b, mat.dcvDiffuse.a,
+        mat.dcvAmbient.r, mat.dcvAmbient.g, mat.dcvAmbient.b, mat.dcvSpecular.r, mat.dcvSpecular.g, mat.dcvSpecular.b,
+        mat.dcvEmissive.r, mat.dcvEmissive.g, mat.dcvEmissive.b, mat.dvPower);
+    Log("        fog color=%08X table=%u vertex=%u start=%.1f end=%.1f range=%u | stage1 tex=%s colorop=%u/%u,%u "
+        "alphaop=%u/%u,%u tci=%X ttf=%u | stage0 tci=%X ttf=%u",
+        rs[D3DRENDERSTATE_FOGCOLOR], rs[D3DRENDERSTATE_FOGTABLEMODE], rs[D3DRENDERSTATE_FOGVERTEXMODE],
+        DW2F(rs[D3DRENDERSTATE_FOGSTART]), DW2F(rs[D3DRENDERSTATE_FOGEND]), rs[D3DRENDERSTATE_RANGEFOGENABLE],
+        tex[1] ? "yes" : "no", tss[1][D3DTSS_COLOROP], tss[1][D3DTSS_COLORARG1], tss[1][D3DTSS_COLORARG2],
+        tss[1][D3DTSS_ALPHAOP], tss[1][D3DTSS_ALPHAARG1], tss[1][D3DTSS_ALPHAARG2],
+        tss[1][D3DTSS_TEXCOORDINDEX], tss[1][D3DTSS_TEXTURETRANSFORMFLAGS],
+        tss[0][D3DTSS_TEXCOORDINDEX], tss[0][D3DTSS_TEXTURETRANSFORMFLAGS]);
+    if (t && !t->rt) DumpTextureNow(t);
     for (int k = 0; k < 3; k++) {
         DWORD i = hitTri[k];
         const float* p = (const float*)((const BYTE*)v + (size_t)i * stride);
@@ -712,7 +875,7 @@ HRESULT Device7::EnumTextureFormats(LPD3DENUMPIXELFORMATSCALLBACK cb, LPVOID ctx
 }
 
 HRESULT Device7::BeginScene() { R::BeginScene(); return D3D_OK; }
-HRESULT Device7::EndScene() { R::EndScene(); return D3D_OK; }
+HRESULT Device7::EndScene() { FlushTransparent(); R::EndScene(); return D3D_OK; }
 
 HRESULT Device7::GetDirect3D(LPDIRECT3D7* out)
 {
@@ -726,6 +889,7 @@ HRESULT Device7::SetRenderTarget(LPDIRECTDRAWSURFACE7 s, DWORD)
 {
     Surface7* t = (Surface7*)s;
     if (!t || !t->rt) return DDERR_INVALIDPARAMS;
+    FlushTransparent();
     t->AddRef();
     if (target) target->Release();
     target = t;
@@ -743,6 +907,7 @@ HRESULT Device7::GetRenderTarget(LPDIRECTDRAWSURFACE7* out)
 
 HRESULT Device7::Clear(DWORD count, LPD3DRECT rects, DWORD flags, D3DCOLOR color, D3DVALUE z, DWORD stencil)
 {
+    FlushTransparent();
     R::Clear(count, (const RECT*)rects, flags, color, z, stencil);   // D3DRECT and RECT share a layout
     return D3D_OK;
 }
@@ -794,7 +959,12 @@ HRESULT Device7::SetMaterial(LPD3DMATERIAL7 m)
     if (!m) return DDERR_INVALIDPARAMS;
     if (Rec()) { recording->material = true; recording->mat = *m; return D3D_OK; }
     mat = *m;
-    R::SetMaterial(m);
+    // The game's materials have specular power 0.  The D3D7 pipeline only lit
+    // specular for power > 0; D3D9 computes pow(x, 0) = 1, a full-strength
+    // highlight over the whole surface (e.g. fish rendered solid white).
+    D3DMATERIAL7 m9 = *m;
+    if (m9.dvPower <= 0.0f) memset(&m9.dcvSpecular, 0, sizeof(m9.dcvSpecular));
+    R::SetMaterial(&m9);
     return D3D_OK;
 }
 
@@ -939,19 +1109,13 @@ HRESULT Device7::PreLoad(LPDIRECTDRAWSURFACE7 s)
 // --- drawing ---------------------------------------------------------------
 HRESULT Device7::DrawPrimitive(D3DPRIMITIVETYPE p, DWORD fvf, LPVOID v, DWORD n, DWORD)
 {
-    for (int i = 0; i < kMaxStages; i++) if (tex[i] && !tex[i]->rt && tex[i]->root->dirty) ApplyTexture(i, tex[i]);
-    const void* dv = PrepareDraw(fvf, v, n);
-    if (g_probe == 2) ProbeDraw(p, fvf, dv, n, NULL, 0);
-    Submit(p, fvf, dv, n, NULL, 0);
+    Draw(p, fvf, v, n, NULL, 0);
     return D3D_OK;
 }
 
 HRESULT Device7::DrawIndexedPrimitive(D3DPRIMITIVETYPE p, DWORD fvf, LPVOID v, DWORD n, LPWORD idx, DWORD ni, DWORD)
 {
-    for (int i = 0; i < kMaxStages; i++) if (tex[i] && !tex[i]->rt && tex[i]->root->dirty) ApplyTexture(i, tex[i]);
-    const void* dv = PrepareDraw(fvf, v, n);
-    if (g_probe == 2) ProbeDraw(p, fvf, dv, n, idx, ni);
-    Submit(p, fvf, dv, n, idx, ni);
+    Draw(p, fvf, v, n, idx, ni);
     return D3D_OK;
 }
 
